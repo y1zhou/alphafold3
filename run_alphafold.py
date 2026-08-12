@@ -73,6 +73,7 @@ _DEFAULT_DB_DIR = _HOME_DIR / 'public_databases'
 class JaxBackend(enum.StrEnum):
   CPU = enum.auto()
   GPU = enum.auto()
+  MPS = enum.auto()  # Apple Metal Performance Shaders (MPS).
 
 
 # Input and output paths.
@@ -326,11 +327,12 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
     0,
-    'Optional override for the GPU device to use for inference, uses zero-based'
-    ' indexing. Defaults to the 0th GPU on the system. Useful on multi-GPU'
+    'Optional override for the JAX device to use for inference. Uses zero-based'
+    ' indexing. Defaults to the 0th device on the system. Useful on multi-GPU'
     ' systems to pin each run to a specific GPU. Note that if GPUs are already'
     ' pre-filtered by the environment (e.g. by using CUDA_VISIBLE_DEVICES),'
-    ' this flag refers to the GPU index after the filtering has been done.',
+    ' this flag refers to the GPU index after the filtering has been done.'
+    ' Contrary to its name, this flag is also used for CPU and MPS devices.',
 )
 _JAX_BACKEND = flags.DEFINE_enum_class(
     'jax_backend',
@@ -338,17 +340,17 @@ _JAX_BACKEND = flags.DEFINE_enum_class(
     enum_class=JaxBackend,
     help=(
         'JAX backend to use. "gpu" uses a GPU for inference. "cpu" uses a CPU'
-        ' only for inference. This is much slower than using a GPU, but can be'
+        ' only for inference which is much slower than using a GPU, but can be'
         ' useful for testing or running on systems without a GPU supported by'
-        ' JAX. If you set this flag to "cpu", you must also set'
-        ' --flash_attention_implementation=xla.'
+        ' JAX. "mps" uses a GPU on Apple Silicon. If you set this flag to "cpu"'
+        ' or "mps", you must also set --flash_attention_implementation=xla.'
     ),
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
-    ['256', '512', '768', '1024', '1280', '1536', '2048', '2560', '3072',
-     '3584', '4096', '4608', '5120'],
+    ['128', '256', '384', '512', '768', '1024', '1280', '1536', '2048', '2560',
+     '3072', '3584', '4096', '4608', '5120'],
     # pyformat: enable
     'Strictly increasing order of token sizes for which to cache compilations.'
     ' For any input with more tokens than the largest bucket size, a new bucket'
@@ -408,7 +410,8 @@ _SAVE_DISTOGRAM = flags.DEFINE_bool(
 _SAVE_TERMS_OF_USE = flags.DEFINE_bool(
     'save_terms_of_use',
     True,
-    'Whether to save the terms of use as an MD file in the output directory.',
+    'Whether to save the terms of use as an MD file in the output directory'
+    ' and add the license to the output mmCIF file.',
 )
 _FORCE_OUTPUT_DIR = flags.DEFINE_bool(
     'force_output_dir',
@@ -677,6 +680,7 @@ def write_outputs(
           output_dir=sample_dir,
           name=f'{job_name}_seed-{seed}_sample-{sample_idx}',
           compress=compress_large_output_files,
+          keep_license=save_terms_of_use,
       )
       ranking_score = float(result.metadata['ranking_score'])
       ranking_scores.append((seed, sample_idx, ranking_score))
@@ -709,6 +713,7 @@ def write_outputs(
         terms_of_use=output_terms if save_terms_of_use else None,
         name=job_name,
         compress=compress_large_output_files,
+        keep_license=save_terms_of_use,
     )
     # Save csv of ranking scores with seeds and sample indices, to allow easier
     # comparison of ranking scores across different runs.
@@ -831,7 +836,8 @@ def process_fold_input(
       output directory instead if the existing one is non-empty.
     compress_large_output_files: If True, compress large output files (mmCIF and
       confidences JSON) using zstandard.
-    save_terms_of_use: If True, write the terms of use to the output directory.
+    save_terms_of_use: If True, write the terms of use to the output directory
+      and add the license to the output mmCIF file.
 
   Returns:
     The processed fold input, or the inference results for each seed.
@@ -934,11 +940,11 @@ def main(_):
 
   if _RUN_INFERENCE.value:
     # Fail early on incompatible devices, but only if we're running inference.
-    if _JAX_BACKEND.value == JaxBackend.CPU:
+    if _JAX_BACKEND.value in {JaxBackend.CPU, JaxBackend.MPS}:
       if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
         raise ValueError(
-            'For CPU-only inference, the --flash_attention_implementation must'
-            ' be set to "xla".'
+            'For CPU-only or MPS inference, --flash_attention_implementation'
+            ' must be set to "xla".'
         )
     elif _JAX_BACKEND.value == JaxBackend.GPU:
       gpu_devices = jax.local_devices(backend='gpu')
@@ -1022,17 +1028,11 @@ def main(_):
 
   if _RUN_INFERENCE.value:
     devices = jax.local_devices(backend=_JAX_BACKEND.value)
-    if _JAX_BACKEND.value == JaxBackend.CPU:
-      device = devices[0]
-      print(f'Found local CPU devices: {devices}, using device 0: {device}')
-    elif _JAX_BACKEND.value == JaxBackend.GPU:
-      print(
-          f'Found local GPU devices: {devices}, using device '
-          f'{_GPU_DEVICE.value}: {devices[_GPU_DEVICE.value]}'
-      )
-      device = devices[_GPU_DEVICE.value]
-    else:
-      raise ValueError(f'Unsupported JAX backend: {_JAX_BACKEND.value}')
+    device = devices[_GPU_DEVICE.value]
+    print(
+        f'Found local {str(_JAX_BACKEND.value).upper()} devices: {devices},'
+        f' using device {_GPU_DEVICE.value}: {device}'
+    )
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
